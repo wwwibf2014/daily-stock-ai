@@ -1,0 +1,6 @@
+yfinance
+pandas_ta
+google-generativeai
+requests
+jinja2
+pandas

@@ -135,7 +135,7 @@ MACD: {float(macd):.2f}
 """.strip()
 
         resp = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemma-3-27b-it",
             contents=prompt,
         )
         data = safe_parse_json((resp.text or "").strip())

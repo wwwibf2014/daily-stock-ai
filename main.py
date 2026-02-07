@@ -1,5 +1,5 @@
 import yfinance as yf
-import pandas_ta as ta
+import pandas as pd
 import google.generativeai as genai
 import requests
 import os
@@ -16,7 +16,6 @@ GITHUB_USER = "wwwibf2014"
 REPO_NAME = "daily-stock-ai"
 
 # 追蹤股票清單 (台股請加 .TW, 美股直接打代號)
-# 範例：台積電, 鴻海, 0050, NVDA, Apple
 TARGET_STOCKS = ["2330.TW", "2317.TW", "0050.TW", "NVDA", "AAPL"] 
 
 # ===========================
@@ -24,54 +23,83 @@ TARGET_STOCKS = ["2330.TW", "2317.TW", "0050.TW", "NVDA", "AAPL"]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 LINE_TOKEN = os.getenv("LINE_TOKEN")
 
-# 設定 Gemini (使用 Flash 模型最快且免費額度高)
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
 results = []
 
+# === 🛠️ 新增：自己計算技術指標的函式 (取代 pandas_ta) ===
+def calculate_indicators(df):
+    # 1. 計算移動平均線 (MA)
+    df['SMA_20'] = df['Close'].rolling(window=20).mean() # 月線
+    df['SMA_60'] = df['Close'].rolling(window=60).mean() # 季線
+    
+    # 2. 計算 RSI (14天)
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI_14'] = 100 - (100 / (1 + rs))
+    
+    # 3. 計算 MACD (12, 26, 9)
+    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD_12_26_9'] = exp1 - exp2
+    df['MACD_SIGNAL'] = df['MACD_12_26_9'].ewm(span=9, adjust=False).mean()
+    
+    return df
+
 def analyze_stock(symbol):
     print(f"🔍 正在分析 {symbol}...")
     try:
-        # 1. 抓取資料 (過去半年，確保有足夠數據算 60MA)
+        # 1. 抓取資料 (過去半年)
         df = yf.Ticker(symbol).history(period="6mo")
         if df.empty: return None
-
-        # 2. 計算技術指標 (RSI, MACD, MA)
-        df.ta.rsi(length=14, append=True)
-        df.ta.macd(append=True)
-        df.ta.sma(length=20, append=True) # 月線
-        df.ta.sma(length=60, append=True) # 季線
-
+        
+        # 2. 呼叫我們自己寫的函式計算指標
+        df = calculate_indicators(df)
+        
+        # 取得最新一筆數據 (iloc[-1])
         latest = df.iloc[-1]
-
+        
         # 3. 準備給 AI 的數據
+        # 使用 .get() 避免剛上市股票數據不足導致報錯
+        rsi = latest.get('RSI_14', 50) 
+        macd = latest.get('MACD_12_26_9', 0)
+        ma20 = latest.get('SMA_20', 0)
+        ma60 = latest.get('SMA_60', 0)
+
+        # 處理 NaN (若數據不足)
+        if pd.isna(rsi): rsi = 50
+        if pd.isna(macd): macd = 0
+        if pd.isna(ma20): ma20 = 0
+
         prompt = f"""
         你是一位嚴謹的華爾街交易員。請根據 {symbol} 的今日技術數據進行分析：
         收盤價: {latest['Close']:.2f}
-        RSI (14): {latest.get('RSI_14', 0):.2f}
-        MACD: {latest.get('MACD_12_26_9', 0):.2f}
-        月線 (20MA): {latest.get('SMA_20', 0):.2f}
-        季線 (60MA): {latest.get('SMA_60', 0):.2f}
-
+        RSI (14): {rsi:.2f}
+        MACD: {macd:.2f}
+        月線 (20MA): {ma20:.2f}
+        季線 (60MA): {ma60:.2f}
+        
         請依照以下 JSON 格式回傳，不要有其他廢話：
         {{
             "signal": "看多" 或 "看空" 或 "觀望",
             "reason": "20字以內的繁體中文短評，例如：RSI過熱且跌破月線，建議獲利了結。"
         }}
         """
-
+        
         response = model.generate_content(prompt)
         ai_text = response.text.strip()
-
-        # 清洗 AI 回傳的格式 (去除可能的 markdown 符號)
+        
+        # 清洗 AI 回傳的格式
         ai_text = ai_text.replace("```json", "").replace("```", "")
         analysis = json.loads(ai_text)
-
+        
         return {
             "symbol": symbol,
             "price": round(latest['Close'], 2),
-            "rsi": round(latest.get('RSI_14', 0), 2),
+            "rsi": round(rsi, 2),
             "signal": analysis.get("signal", "觀望"),
             "comment": analysis.get("reason", "AI 無法分析"),
             "date": datetime.now().strftime('%Y-%m-%d')
@@ -114,7 +142,7 @@ html_template = """
 </head>
 <body>
     <h1>📈 AI 每日股市戰報 <br><span style="font-size:0.5em; color:#888">{{ date }}</span></h1>
-
+    
     {% for r in results %}
     <div class="card">
         <div class="header">

@@ -1,0 +1,42 @@
+name: 每日股市自動化
+
+on:
+  schedule:
+    # 設定每天自動執行時間
+    # 台灣時間下午 3:00 = UTC 早上 7:00
+    # (GitHub 使用 UTC 時間，所以要減 8 小時)
+    - cron: '0 7 * * 1-5' # 週一到週五執行
+  workflow_dispatch: # 允許手動按按鈕測試
+
+permissions:
+  contents: write # 給予權限寫入 index.html
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 📥 下載程式碼
+      uses: actions/checkout@v3
+
+    - name: 🐍 設定 Python 環境
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: 📦 安裝套件
+      run: pip install -r requirements.txt
+
+    - name: 🤖 執行 AI 分析
+      env:
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+      run: python main.py
+
+    - name: 🚀 更新網頁 (部署到 GitHub Pages)
+      run: |
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        git add index.html
+        git commit -m "Auto-update daily report" || echo "No changes to commit"
+        git push

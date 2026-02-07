@@ -1,0 +1,157 @@
+import yfinance as yf
+import pandas_ta as ta
+import google.generativeai as genai
+import requests
+import os
+import time
+import json
+from datetime import datetime
+from jinja2 import Template
+
+# ===========================
+# 🔧 使用者設定區 (請修改這裡)
+# ===========================
+# 您的 GitHub 帳號 (用於生成網頁連結)
+GITHUB_USER = "wwwibf2014" 
+REPO_NAME = "daily-stock-ai"
+
+# 追蹤股票清單 (台股請加 .TW, 美股直接打代號)
+# 範例：台積電, 鴻海, 0050, NVDA, Apple
+TARGET_STOCKS = ["2330.TW", "2317.TW", "0050.TW", "NVDA", "AAPL"] 
+
+# ===========================
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+LINE_TOKEN = os.getenv("LINE_TOKEN")
+
+# 設定 Gemini (使用 Flash 模型最快且免費額度高)
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
+
+results = []
+
+def analyze_stock(symbol):
+    print(f"🔍 正在分析 {symbol}...")
+    try:
+        # 1. 抓取資料 (過去半年，確保有足夠數據算 60MA)
+        df = yf.Ticker(symbol).history(period="6mo")
+        if df.empty: return None
+
+        # 2. 計算技術指標 (RSI, MACD, MA)
+        df.ta.rsi(length=14, append=True)
+        df.ta.macd(append=True)
+        df.ta.sma(length=20, append=True) # 月線
+        df.ta.sma(length=60, append=True) # 季線
+
+        latest = df.iloc[-1]
+
+        # 3. 準備給 AI 的數據
+        prompt = f"""
+        你是一位嚴謹的華爾街交易員。請根據 {symbol} 的今日技術數據進行分析：
+        收盤價: {latest['Close']:.2f}
+        RSI (14): {latest.get('RSI_14', 0):.2f}
+        MACD: {latest.get('MACD_12_26_9', 0):.2f}
+        月線 (20MA): {latest.get('SMA_20', 0):.2f}
+        季線 (60MA): {latest.get('SMA_60', 0):.2f}
+
+        請依照以下 JSON 格式回傳，不要有其他廢話：
+        {{
+            "signal": "看多" 或 "看空" 或 "觀望",
+            "reason": "20字以內的繁體中文短評，例如：RSI過熱且跌破月線，建議獲利了結。"
+        }}
+        """
+
+        response = model.generate_content(prompt)
+        ai_text = response.text.strip()
+
+        # 清洗 AI 回傳的格式 (去除可能的 markdown 符號)
+        ai_text = ai_text.replace("```json", "").replace("```", "")
+        analysis = json.loads(ai_text)
+
+        return {
+            "symbol": symbol,
+            "price": round(latest['Close'], 2),
+            "rsi": round(latest.get('RSI_14', 0), 2),
+            "signal": analysis.get("signal", "觀望"),
+            "comment": analysis.get("reason", "AI 無法分析"),
+            "date": datetime.now().strftime('%Y-%m-%d')
+        }
+    except Exception as e:
+        print(f"❌ Error {symbol}: {e}")
+        return None
+
+# === 主程式迴圈 ===
+for stock in TARGET_STOCKS:
+    res = analyze_stock(stock)
+    if res:
+        results.append(res)
+    time.sleep(2) # 休息一下避免 API 限制
+
+# === 生成 HTML 報表 ===
+html_template = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>股市 AI 戰情室</title>
+<style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; padding: 20px; max-width: 800px; margin: 0 auto; }
+    h1 { text-align: center; color: #333; margin-bottom: 30px; }
+    .card { background: white; border-radius: 15px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); display: flex; flex-direction: column; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+    .symbol { font-size: 1.4em; font-weight: bold; color: #1a1a1a; }
+    .badge { padding: 6px 12px; border-radius: 20px; color: white; font-weight: bold; font-size: 0.9em; }
+    .badge.看多 { background: #ff4d4d; }
+    .badge.看空 { background: #00cc66; }
+    .badge.觀望 { background: #888; }
+    .data-row { display: flex; gap: 15px; margin-bottom: 15px; color: #666; font-size: 0.9em; }
+    .comment-box { background: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 4px solid #ddd; }
+    .comment-box.看多 { border-left-color: #ff4d4d; }
+    .comment-box.看空 { border-left-color: #00cc66; }
+    .footer { text-align: center; color: #aaa; margin-top: 30px; font-size: 0.8em; }
+</style>
+</head>
+<body>
+    <h1>📈 AI 每日股市戰報 <br><span style="font-size:0.5em; color:#888">{{ date }}</span></h1>
+
+    {% for r in results %}
+    <div class="card">
+        <div class="header">
+            <span class="symbol">{{ r.symbol }}</span>
+            <div class="badge {{ r.signal }}">{{ r.signal }}</div>
+        </div>
+        <div class="data-row">
+            <span>收盤: <b>{{ r.price }}</b></span>
+            <span>RSI: <b>{{ r.rsi }}</b></span>
+        </div>
+        <div class="comment-box {{ r.signal }}">
+            🤖 <b>AI：</b>{{ r.comment }}
+        </div>
+    </div>
+    {% endfor %}
+    <div class="footer">Generated by GitHub Actions & Gemini</div>
+</body>
+</html>
+"""
+
+template = Template(html_template)
+html_output = template.render(results=results, date=datetime.now().strftime('%Y-%m-%d'))
+
+with open("index.html", "w", encoding="utf-8") as f:
+    f.write(html_output)
+
+# === 發送 Line 通知 ===
+bull_count = len([x for x in results if x['signal']=='看多'])
+bear_count = len([x for x in results if x['signal']=='看空'])
+page_url = f"https://{GITHUB_USER}.github.io/{REPO_NAME}/"
+
+msg = f"\n📊 {datetime.now().strftime('%m/%d')} 股市戰報已生成！\n"
+msg += f"🔴 看多：{bull_count} 檔\n"
+msg += f"🟢 看空：{bear_count} 檔\n"
+msg += f"⚪ 觀望：{len(results) - bull_count - bear_count} 檔\n\n"
+msg += f"👉 點擊查看完整圖表：\n{page_url}"
+
+requests.post("https://notify-api.line.me/api/notify", 
+              headers={"Authorization": f"Bearer {LINE_TOKEN}"}, 
+              data={"message": msg})

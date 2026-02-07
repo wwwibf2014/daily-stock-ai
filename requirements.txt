@@ -1,7 +1,6 @@
 yfinance
-git+https://github.com/twopirllc/pandas-ta.git@development
-numpy<2.0.0
-pandas<2.0.0
+pandas
+numpy
 google-generativeai
 requests
 jinja2

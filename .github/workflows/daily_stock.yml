@@ -2,41 +2,58 @@ name: 每日股市自動化
 
 on:
   schedule:
-    # 設定每天自動執行時間
-    # 台灣時間下午 3:00 = UTC 早上 7:00
-    # (GitHub 使用 UTC 時間，所以要減 8 小時)
-    - cron: '0 7 * * 1-5' # 週一到週五執行
-  workflow_dispatch: # 允許手動按按鈕測試
+    - cron: '0 7 * * 1-5' # 週一到週五，UTC 07:00 = 台灣 15:00
+  workflow_dispatch:
 
 permissions:
-  contents: write # 給予權限寫入 index.html
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
-
     steps:
-    - name: 📥 下載程式碼
-      uses: actions/checkout@v3
+      - name: 📥 下載程式碼
+        uses: actions/checkout@v4
 
-    - name: 🐍 設定 Python 環境
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.9'
+      - name: 🐍 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-    - name: 📦 安裝套件
-      run: pip install -r requirements.txt
+      - name: 📦 安裝套件
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: 🤖 執行 AI 分析
-      env:
-        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
-      run: python main.py
+      - name: 🤖 產生報表（輸出 index.html）
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+          LINE_TO: ${{ secrets.LINE_TO }}
+          GITHUB_USER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          python main.py
+          mkdir -p site
+          mv index.html site/index.html
 
-    - name: 🚀 更新網頁 (部署到 GitHub Pages)
-      run: |
-        git config --global user.name 'github-actions[bot]'
-        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git add index.html
-        git commit -m "Auto-update daily report" || echo "No changes to commit"
-        git push
+      - name: 📦 上傳 Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    steps:
+      - name: 🚀 部署到 GitHub Pages
+        uses: actions/deploy-pages@v4

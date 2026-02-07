@@ -67,22 +67,24 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 # ✅ 關鍵：用 requests.Session + User-Agent + 重試，避免 Yahoo 擋/暫時失敗
 def fetch_history(symbol: str, period: str = "1y", retries: int = 3) -> pd.DataFrame:
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-    })
-
     last_err = None
+
     for i in range(1, retries + 1):
         try:
-            t = yf.Ticker(symbol, session=sess)
-            df = t.history(period=period, auto_adjust=False)
+            # ✅ 讓 yfinance 自己處理 session（避免 curl_cffi 限制）
+            df = yf.Ticker(symbol).history(period=period, auto_adjust=False)
+
+            # 若 Ticker().history() 抽風，改用 download 當備援
+            if df is None or df.empty:
+                df = yf.download(symbol, period=period, progress=False, auto_adjust=False)
+
             if df is None or df.empty:
                 raise RuntimeError("yfinance 回傳空資料（df.empty）")
             if "Close" not in df.columns:
                 raise RuntimeError(f"yfinance 欄位異常：{list(df.columns)}")
+
             return df
+
         except Exception as e:
             last_err = e
             wait = 1.5 * i
@@ -90,6 +92,7 @@ def fetch_history(symbol: str, period: str = "1y", retries: int = 3) -> pd.DataF
             time.sleep(wait)
 
     raise RuntimeError(f"{symbol} 抓取最終失敗：{last_err}")
+
 
 
 def analyze_stock(client: genai.Client, symbol: str) -> tuple[dict | None, str | None]:

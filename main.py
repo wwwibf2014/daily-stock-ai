@@ -16,13 +16,18 @@ from google import genai
 # ===========================
 TARGET_STOCKS = ["2330.TW", "2317.TW", "0050.TW", "NVDA", "AAPL"]
 TZ = ZoneInfo("Asia/Taipei")
+
+# 你指定的模型
 GEMINI_MODEL = "gemma-3-27b-it"
+
+# 圖表顯示根數（你指定 120）
 CHART_BARS = 120
 
 # GitHub Pages 連結（可用環境變數覆蓋）
 GITHUB_USER = os.getenv("GITHUB_USER", "wwwibf2014")
 REPO_NAME = os.getenv("REPO_NAME", "daily-stock-ai")
 
+# 股票繁體中文名稱（可自行擴充）
 STOCK_NAMES_ZH = {
     "2330.TW": "台積電",
     "2317.TW": "鴻海",
@@ -40,6 +45,7 @@ def require_env(name: str) -> str:
         raise RuntimeError(f"缺少必要環境變數：{name}")
     return v
 
+
 def safe_parse_json(text: str) -> dict:
     cleaned = (text or "").strip().replace("```json", "").replace("```", "").strip()
     try:
@@ -50,30 +56,34 @@ def safe_parse_json(text: str) -> dict:
             raise ValueError(f"AI 回傳不是 JSON：{cleaned[:200]}")
         return json.loads(m.group(0))
 
+
 def flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    把 yfinance 偶爾出現的 MultiIndex 欄位扁平化，確保 Open/High/Low/Close/Volume 是單層欄位。
+    yfinance 偶爾會回傳 MultiIndex 欄位（兩層），造成 df['Close'] 變成 DataFrame。
+    這裡把欄位扁平化，保證 Open/High/Low/Close/Volume 是單層。
     """
     if isinstance(df.columns, pd.MultiIndex):
-        # 可能像 ('Close','AAPL') 或 ('AAPL','Close')，我們把能辨識的那層取出
         new_cols = []
         for col in df.columns:
-            # col 是 tuple
-            parts = [str(x) for x in col if str(x) != ""]  # 避免空字串
-            # 常見情況：('Close', 'AAPL') -> Close
-            # 或 ('AAPL','Close') -> Close
-            if "Open" in parts: new_cols.append("Open")
-            elif "High" in parts: new_cols.append("High")
-            elif "Low" in parts: new_cols.append("Low")
-            elif "Close" in parts: new_cols.append("Close")
-            elif "Volume" in parts: new_cols.append("Volume")
+            parts = [str(x) for x in col if str(x) != ""]
+            if "Open" in parts:
+                new_cols.append("Open")
+            elif "High" in parts:
+                new_cols.append("High")
+            elif "Low" in parts:
+                new_cols.append("Low")
+            elif "Close" in parts:
+                new_cols.append("Close")
+            elif "Volume" in parts:
+                new_cols.append("Volume")
             else:
                 new_cols.append("_".join(parts))
         df.columns = new_cols
     return df
 
+
 def nz(x, default=0.0) -> float:
-    if x is None or (isinstance(x, float) and pd.isna(x)):
+    if x is None:
         return default
     try:
         if pd.isna(x):
@@ -82,38 +92,41 @@ def nz(x, default=0.0) -> float:
         pass
     return float(x)
 
+
 # ===========================
 # 技術指標（繁體中文）
 # ===========================
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
+    # 均線
     df["20日均線"] = df["Close"].rolling(20).mean()
     df["60日均線"] = df["Close"].rolling(60).mean()
 
-    # RSI(14)
+    # RSI(14) 相對強弱指標
     delta = df["Close"].diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss.replace(0, pd.NA)
     df["相對強弱指標RSI(14)"] = 100 - (100 / (1 + rs))
 
-    # MACD(12,26,9)
+    # MACD(12,26,9) 平滑異同移動平均線
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
     df["平滑異同移動平均線MACD"] = ema12 - ema26
     df["MACD訊號線"] = df["平滑異同移動平均線MACD"].ewm(span=9, adjust=False).mean()
     df["MACD柱狀體"] = df["平滑異同移動平均線MACD"] - df["MACD訊號線"]
 
-    # 20日乖離率(%)  ✅ 這裡保證 Close/均線是 Series
+    # 20日乖離率(%)
     df["20日乖離率(%)"] = (df["Close"] / df["20日均線"] - 1) * 100
 
-    # 20日均量 & 均量比
+    # 成交量：20日均量、均量比
     if "Volume" in df.columns:
         df["20日均量"] = df["Volume"].rolling(20).mean()
         df["均量比(今日/20日)"] = df["Volume"] / df["20日均量"]
 
     return df
+
 
 def fetch_history(symbol: str, period="1y", retries=3) -> pd.DataFrame:
     last_err = None
@@ -124,27 +137,30 @@ def fetch_history(symbol: str, period="1y", retries=3) -> pd.DataFrame:
                 raise RuntimeError("yfinance 回傳空資料")
             df = flatten_yf_columns(df)
 
-            # 必要欄位檢查
             for col in ("Open", "High", "Low", "Close"):
                 if col not in df.columns:
                     raise RuntimeError(f"缺少欄位 {col}，目前欄位：{list(df.columns)}")
 
-            # 確保是數字
             for col in ("Open", "High", "Low", "Close", "Volume"):
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
 
             return df
-
         except Exception as e:
             last_err = e
-            time.sleep(1.2 * i)
+            wait = 1.2 * i
+            print(f"⚠️ 抓取失敗 {symbol}（第 {i}/{retries} 次）：{e}，{wait:.1f}s 後重試")
+            time.sleep(wait)
+
     raise RuntimeError(f"{symbol} 抓取最終失敗：{last_err}")
 
+
+# ===========================
+# 分析單檔
+# ===========================
 def analyze_stock(client: genai.Client, symbol: str):
     df = fetch_history(symbol, period="1y", retries=3)
     df = calculate_indicators(df)
-
     latest = df.iloc[-1]
 
     close = nz(latest.get("Close"), 0.0)
@@ -197,20 +213,24 @@ MACD柱狀體：{macd_hist:.4f}
     if signal not in ("偏多", "偏空", "觀望"):
         signal = "觀望"
 
-    # 近 120 根資料做圖
-    tail = df.tail(CHART_BARS)
+    tips = data.get("tips", [])
+    if not isinstance(tips, list):
+        tips = []
 
-    # K線資料（candlestick 需要 o/h/l/c）
+    # 近 120 根資料做圖
+    tail = df.tail(CHART_BARS).copy()
+    labels = [d.strftime("%Y-%m-%d") for d in tail.index]
+
+    # ✅ 修正：K線資料每筆都帶 x，讓 financial plugin 正常吃到
     ohlc = []
-    for o, h, l, c in zip(tail["Open"], tail["High"], tail["Low"], tail["Close"]):
+    for dt, o, h, l, c in zip(labels, tail["Open"], tail["High"], tail["Low"], tail["Close"]):
         if pd.isna(o) or pd.isna(h) or pd.isna(l) or pd.isna(c):
-            ohlc.append(None)
-        else:
-            ohlc.append({"o": float(o), "h": float(h), "l": float(l), "c": float(c)})
+            continue
+        ohlc.append({"x": dt, "o": float(o), "h": float(h), "l": float(l), "c": float(c)})
 
     chart_data = {
-        "labels": [d.strftime("%Y-%m-%d") for d in tail.index],
-        "ohlc": ohlc,
+        "labels": labels,  # 其他圖表使用
+        "ohlc": ohlc,      # K線使用
         "volume": [0 if pd.isna(v) else float(v) for v in tail.get("Volume", pd.Series([0]*len(tail)))],
         "ma20": [None if pd.isna(x) else float(x) for x in tail["20日均線"]],
         "ma60": [None if pd.isna(x) else float(x) for x in tail["60日均線"]],
@@ -220,10 +240,6 @@ MACD柱狀體：{macd_hist:.4f}
         "macd_sig": [None if pd.isna(x) else float(x) for x in tail["MACD訊號線"]],
         "macd_hist": [None if pd.isna(x) else float(x) for x in tail["MACD柱狀體"]],
     }
-
-    tips = data.get("tips", [])
-    if not isinstance(tips, list):
-        tips = []
 
     return {
         "symbol": symbol,
@@ -252,6 +268,10 @@ MACD柱狀體：{macd_hist:.4f}
         "chart_data": json.dumps(chart_data, ensure_ascii=False),
     }
 
+
+# ===========================
+# HTML（教學版 + tooltip + 4張圖）
+# ===========================
 def render_html(results, errors):
     html_template = r"""
 <!DOCTYPE html>
@@ -287,7 +307,7 @@ def render_html(results, errors):
   .chip { background:#f7f7f7; padding: 6px 10px; border-radius: 12px; color:#333; }
   .chip b { font-weight: 900; }
 
-  /* ✅ tooltip */
+  /* tooltip */
   .tt { position: relative; display: inline-block; cursor: help; font-weight: 900; text-decoration: underline dotted; text-underline-offset: 3px; }
   .tt .tip {
     position: absolute;
@@ -407,36 +427,43 @@ def render_html(results, errors):
   <script>
     (function(){
       const data = {{ r.chart_data | safe }};
-      const labels = data.labels;
 
+      // ✅ K線：使用 timeseries + parsing:false，並且 ohlc 每筆都帶 x
       new Chart(document.getElementById("k{{ loop.index }}"), {
         type: "candlestick",
-        data: { labels: labels, datasets: [
-          { label: "K線（開高低收）", data: data.ohlc },
-          { label: "20日均線", type: "line", data: data.ma20, spanGaps: true },
-          { label: "60日均線", type: "line", data: data.ma60, spanGaps: true }
-        ]},
-        options: { plugins: { legend: { display: true } }, scales: { x: { display:false } } }
+        data: {
+          datasets: [
+            { label: "K線（開高低收）", data: data.ohlc },
+            { label: "20日均線", type: "line", data: data.ma20, spanGaps: true },
+            { label: "60日均線", type: "line", data: data.ma60, spanGaps: true }
+          ]
+        },
+        options: {
+          parsing: false,
+          plugins: { legend: { display: true } },
+          scales: { x: { type: "timeseries", time: { unit: "day" }, display:false } }
+        }
       });
 
       new Chart(document.getElementById("v{{ loop.index }}"), {
-        data: { labels: labels, datasets: [
-          { type:"bar", label:"成交量", data: data.volume },
-          { type:"line", label:"20日均量", data: data.vol_ma20, spanGaps:true }
-        ]},
+        data: {
+          labels: data.labels,
+          datasets: [
+            { type:"bar", label:"成交量", data: data.volume },
+            { type:"line", label:"20日均量", data: data.vol_ma20, spanGaps:true }
+          ]
+        },
         options: { plugins: { legend: { display: true } }, scales: { x: { display:false } } }
       });
 
       new Chart(document.getElementById("rsi{{ loop.index }}"), {
         type: "line",
-        data: { labels: labels, datasets: [
-          { label:"相對強弱指標 RSI(14)", data: data.rsi, spanGaps:true }
-        ]},
+        data: { labels: data.labels, datasets: [{ label:"相對強弱指標 RSI(14)", data: data.rsi, spanGaps:true }] },
         options: { plugins: { legend: { display: true } }, scales: { x: { display:false } } }
       });
 
       new Chart(document.getElementById("macd{{ loop.index }}"), {
-        data: { labels: labels, datasets: [
+        data: { labels: data.labels, datasets: [
           { type:"bar", label:"MACD柱狀體", data: data.macd_hist },
           { type:"line", label:"MACD", data: data.macd, spanGaps:true },
           { type:"line", label:"MACD訊號線", data: data.macd_sig, spanGaps:true }
@@ -459,6 +486,7 @@ def render_html(results, errors):
         model=GEMINI_MODEL,
     )
 
+
 def line_push(line_token: str, to_id: str, msg: str):
     r = requests.post(
         "https://api.line.me/v2/bot/message/push",
@@ -468,6 +496,7 @@ def line_push(line_token: str, to_id: str, msg: str):
     )
     if r.status_code >= 300:
         raise RuntimeError(f"LINE 推播失敗 {r.status_code}: {r.text[:200]}")
+
 
 def main():
     client = genai.Client(api_key=require_env("GEMINI_API_KEY"))
@@ -486,10 +515,12 @@ def main():
             errors.append(f"{s}: {e}")
             print(f"❌ {s} 失敗：{e}")
 
+    # 產出網頁
     html = render_html(results, errors)
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html)
 
+    # LINE 摘要
     page_url = f"https://{GITHUB_USER}.github.io/{REPO_NAME}/"
     bull = sum(1 for x in results if x["signal"] == "偏多")
     bear = sum(1 for x in results if x["signal"] == "偏空")
@@ -507,6 +538,7 @@ def main():
         print("✅ LINE 推播成功")
     except Exception as e:
         print(f"⚠️ LINE 推播失敗（不影響網頁生成）：{e}")
+
 
 if __name__ == "__main__":
     main()

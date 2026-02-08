@@ -30,6 +30,12 @@ MARKET_INDICES = [
     {"symbol": "^IXIC", "name_zh": "那斯達克（NASDAQ）", "market": "US"},
 ]
 
+# 個股的「基準大盤」：用來算相關係數/Beta
+BENCHMARK_FOR = {
+    "TW": {"symbol": "^TWII", "name_zh": "台股加權指數"},
+    "US": {"symbol": "^GSPC", "name_zh": "標普500（S&P 500）"},
+}
+
 STOCK_NAMES_ZH = {
     "2330.TW": "台積電",
     "2317.TW": "鴻海",
@@ -84,6 +90,9 @@ def nz(x, default=0.0) -> float:
 def clip_text(s: str, n: int) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[:n].rstrip() + "…"
+
+def market_of_symbol(symbol: str) -> str:
+    return "TW" if symbol.upper().endswith(".TW") else "US"
 
 # ===========================
 # 技術指標（繁體中文）
@@ -156,6 +165,45 @@ def build_chart_data(df: pd.DataFrame) -> dict:
         "macd_sig": [None if pd.isna(x) else float(x) for x in tail["MACD訊號線"]],
         "macd_hist": [None if pd.isna(x) else float(x) for x in tail["MACD柱狀體"]],
     }
+
+# ===========================
+# ✅ 新增：相關係數（20日）+ Beta（60日）
+# ===========================
+def compute_corr_beta(stock_df: pd.DataFrame, bench_df: pd.DataFrame, corr_window=20, beta_window=60):
+    """
+    用「日報酬率」計算：
+    - corr20 = corr(stock_ret, bench_ret) over last 20 returns
+    - beta60 = cov(stock_ret, bench_ret) / var(bench_ret) over last 60 returns
+    若資料不足，回傳 None。
+    """
+    s = stock_df[["Close"]].rename(columns={"Close": "stock"})
+    b = bench_df[["Close"]].rename(columns={"Close": "bench"})
+
+    merged = s.join(b, how="inner")
+    merged = merged.dropna()
+    if len(merged) < max(corr_window, beta_window) + 5:
+        return None, None
+
+    ret = merged.pct_change().dropna()
+    if len(ret) < max(corr_window, beta_window):
+        return None, None
+
+    corr20 = ret["stock"].tail(corr_window).corr(ret["bench"].tail(corr_window))
+
+    tail_beta = ret.tail(beta_window)
+    var_b = tail_beta["bench"].var()
+    if var_b == 0 or pd.isna(var_b):
+        beta60 = None
+    else:
+        cov = tail_beta["stock"].cov(tail_beta["bench"])
+        beta60 = cov / var_b
+
+    if pd.isna(corr20):
+        corr20 = None
+    if beta60 is not None and pd.isna(beta60):
+        beta60 = None
+
+    return corr20, beta60
 
 # ===========================
 # 市場環境：抓指數 + AI白話總結（不用出買賣建議）
@@ -242,10 +290,11 @@ MACD柱狀體：{macd_hist:.4f}
     }
 
 # ===========================
-# 個股分析（含：與大盤關係教學文字）
+# 個股分析（含：與大盤關係教學文字 + corr/beta）
 # ===========================
-def analyze_stock(client: genai.Client, symbol: str, market_context: dict):
-    df = calculate_indicators(fetch_history(symbol, period="1y", retries=3))
+def analyze_stock(client: genai.Client, symbol: str, market_context: dict, benchmark_df: pd.DataFrame, benchmark_name_zh: str):
+    stock_df_raw = fetch_history(symbol, period="1y", retries=3)
+    df = calculate_indicators(stock_df_raw)
     latest = df.iloc[-1]
 
     close = nz(latest.get("Close"), 0.0)
@@ -266,10 +315,16 @@ def analyze_stock(client: genai.Client, symbol: str, market_context: dict):
     vol_ma20 = nz(latest.get("20日均量"), 0.0)
     vr = nz(latest.get("均量比(今日/20日)"), 0.0)
 
-    # 取市場環境（縮短避免 prompt 太長）
+    # ✅ 計算 corr/beta（用 raw close）
+    corr20, beta60 = compute_corr_beta(stock_df_raw, benchmark_df, corr_window=20, beta_window=60)
+
+    # 市場摘要（縮短避免 prompt 太長）
     tw = market_context.get("TWII", {})
     us_sp = market_context.get("GSPC", {})
     us_nq = market_context.get("IXIC", {})
+
+    corr_txt = "資料不足" if corr20 is None else f"{corr20:.2f}"
+    beta_txt = "資料不足" if beta60 is None else f"{beta60:.2f}"
 
     prompt = f"""
 你是「給完全新手看的股市老師」，請用非常白話的繁體中文解釋，不要給買賣建議。
@@ -288,17 +343,23 @@ MACD柱狀體：{macd_hist:.4f}
 均量比：{vr:.2f}
 20日乖離率(%)：{bias20:.2f}
 
+和大盤的關聯（用日報酬率算）：
+- 20日相關係數（-1到+1）：{corr_txt}（越接近+1越跟著大盤一起走）
+- 60日Beta：{beta_txt}（大盤動1%，它大概動幾%）
+
 市場環境（大盤）摘要：
-- 台股加權指數：{tw.get("mood","")}，{tw.get("summary","")}
+- 台股加權：{tw.get("mood","")}，{tw.get("summary","")}
 - 美股S&P500：{us_sp.get("mood","")}，{us_sp.get("summary","")}
 - 美股NASDAQ：{us_nq.get("mood","")}，{us_nq.get("summary","")}
+
+基準大盤（用來算相關/Beta）：{benchmark_name_zh}
 
 請只回傳 JSON：
 {{
   "signal": "偏多" 或 "偏空" 或 "觀望",
   "reason": "60字內白話解釋（一定要提到：均線 + 成交量 + RSI或MACD其中一個）",
   "tips": ["新手重點1(20字內)","新手重點2(20字內)","新手重點3(20字內)"],
-  "market_link": "用白話解釋：大盤與個股可能的關係（60字內，像順風/逆風的比喻）"
+  "market_link": "用白話解釋：大盤與個股可能的關係（60字內，請把相關係數或Beta講成白話）"
 }}
 """.strip()
 
@@ -323,6 +384,10 @@ MACD柱狀體：{macd_hist:.4f}
         "tips": [str(x).strip() for x in tips[:3]],
         "market_link": market_link,
 
+        "benchmark_name_zh": benchmark_name_zh,
+        "corr20": None if corr20 is None else round(float(corr20), 2),
+        "beta60": None if beta60 is None else round(float(beta60), 2),
+
         "open_now": round(open_, 2),
         "high_now": round(high, 2),
         "low_now": round(low, 2),
@@ -343,7 +408,7 @@ MACD柱狀體：{macd_hist:.4f}
     }
 
 # ===========================
-# HTML（固定 Chart.js 版本 + 自繪K線 + 市場環境區塊）
+# HTML（固定 Chart.js 版本 + 自繪K線 + 顯示corr/beta）
 # ===========================
 def render_html(market_results, stock_results, errors):
     html_template = r"""
@@ -354,7 +419,6 @@ def render_html(market_results, stock_results, errors):
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 每日股市戰報（教學版）</title>
 
-<!-- ✅ 固定 Chart.js 版本 -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
 <style>
@@ -410,7 +474,7 @@ def render_html(market_results, stock_results, errors):
     ① 先看 <b>市場環境（大盤）</b>：像海流，順風逆風會影響多數個股。<br>
     ② 再看 <b>K線＋均線</b>：收盤在均線上方通常偏強；跌破均線可能偏弱。<br>
     ③ 看 <b>成交量</b>：量像力氣；價漲＋量增更有底氣。<br>
-    ④ 用 <b>RSI / MACD</b> 做確認：熱度與動能是否一致。
+    ④ 加分題：看 <b>相關係數 / Beta</b>：它跟大盤「黏不黏」＆「放大幾倍」。
   </div>
 </div>
 
@@ -418,7 +482,7 @@ def render_html(market_results, stock_results, errors):
   <div class="warn"><b>本次有錯誤</b><div class="mono">{{ errors|join("\n") }}</div></div>
 {% endif %}
 
-<!-- ========== 市場環境（大盤） ========== -->
+<!-- 市場環境（大盤） -->
 <div class="panel">
   <div style="font-weight:900; font-size:1.1em; margin-bottom:8px;">🌏 今日市場環境（大盤）</div>
   <div class="market-grid">
@@ -541,18 +605,18 @@ def render_html(market_results, stock_results, errors):
     </div>
     {% endfor %}
   </div>
-  <div class="hint" style="margin-top:10px;">
-    <b>教學重點：</b>大盤像海流，若大盤偏空，很多個股就算短線反彈也可能走得辛苦；若大盤偏多，個股更容易順風上行。
-  </div>
 </div>
 
-<!-- ========== 個股 ========== -->
+<!-- 個股 -->
 {% for r in stock_results %}
 <div class="card">
   <div class="top">
     <div>
       <div class="title">{{ r.symbol }}{% if r.name_zh %}（{{ r.name_zh }}）{% endif %}</div>
       <div class="kline">今日：開 <b>{{ r.open_now }}</b>｜高 <b>{{ r.high_now }}</b>｜低 <b>{{ r.low_now }}</b>｜收 <b>{{ r.price }}</b></div>
+      <div class="hint" style="margin-top:6px;">
+        基準大盤：<b>{{ r.benchmark_name_zh }}</b>（用來算相關係數/Beta）
+      </div>
     </div>
     <div class="badge {{ r.signal }}">{{ r.signal }}</div>
   </div>
@@ -564,9 +628,11 @@ def render_html(market_results, stock_results, errors):
     <div class="chip">MACD：<b>{{ r.macd_now }}</b></div>
     <div class="chip">MACD柱狀體：<b>{{ r.macd_hist_now }}</b></div>
     <div class="chip">成交量：<b>{{ r.volume_now }}</b></div>
-    <div class="chip">20日均量：<b>{{ r.vol_ma20_now }}</b></div>
     <div class="chip">均量比：<b>{{ r.vr_now }}</b></div>
     <div class="chip">20日乖離率：<b>{{ r.bias20_now }}</b></div>
+
+    <div class="chip">20日相關係數：<b>{% if r.corr20 is not none %}{{ r.corr20 }}{% else %}資料不足{% endif %}</b></div>
+    <div class="chip">60日Beta：<b>{% if r.beta60 is not none %}{{ r.beta60 }}{% else %}資料不足{% endif %}</b></div>
   </div>
 
   <div class="teachbox {{ r.signal }}">
@@ -578,6 +644,9 @@ def render_html(market_results, stock_results, errors):
   <div class="teachbox" style="border-left-color:#4d7cff;">
     <div class="teach-title">🌊 大盤 × 個股：可能的關係（教學版）</div>
     <div>{{ r.market_link }}</div>
+    <div class="hint" style="margin-top:6px;">
+      小抄：相關係數越接近 +1 → 越「跟大盤一起走」；Beta 大於 1 → 大盤動一下，它通常「放大波動」。
+    </div>
   </div>
 
   <div class="charts">
@@ -671,7 +740,7 @@ def render_html(market_results, stock_results, errors):
 </div>
 {% endfor %}
 
-<div class="footer">教學提醒：指標是工具，不是保證答案。建議用「大盤→趨勢→量→RSI/MACD」的順序閱讀。</div>
+<div class="footer">教學提醒：指標是工具，不是保證答案。建議用「大盤→趨勢→量→RSI/MACD→相關/Beta」的順序閱讀。</div>
 </body>
 </html>
 """
@@ -703,26 +772,49 @@ def main():
     # 先做市場環境（大盤）
     market_results = []
     market_context = {}
+    bench_cache = {}  # 避免同一個 benchmark 重抓多次
+
     for idx in MARKET_INDICES:
         try:
             print(f"🌏 分析大盤 {idx['symbol']} ...")
             r = analyze_market_index(client, idx["symbol"], idx["name_zh"])
             market_results.append(r)
-            # 做成 prompt 用的 context（縮短存摘要即可）
+
             key = idx["symbol"].replace("^", "")
             market_context[key] = {"mood": r["mood"], "summary": clip_text(r["summary"], 80)}
-            time.sleep(0.8)
+            time.sleep(0.7)
         except Exception as e:
             errors.append(f"{idx['symbol']}: {e}")
             print(f"❌ 大盤 {idx['symbol']} 失敗：{e}")
+
+    # 把 benchmark 的 raw df 準備好（TW用TWII，US用GSPC）
+    try:
+        tw_bm = BENCHMARK_FOR["TW"]
+        us_bm = BENCHMARK_FOR["US"]
+        bench_cache[tw_bm["symbol"]] = fetch_history(tw_bm["symbol"], period="1y", retries=3)
+        bench_cache[us_bm["symbol"]] = fetch_history(us_bm["symbol"], period="1y", retries=3)
+    except Exception as e:
+        # 如果 benchmark 抓不到，corr/beta 會變資料不足（不影響整體）
+        errors.append(f"benchmark: {e}")
+        print(f"⚠️ benchmark 抓取失敗：{e}")
 
     # 個股
     stock_results = []
     for s in TARGET_STOCKS:
         try:
-            print(f"🔍 正在分析 {s} ...")
-            stock_results.append(analyze_stock(client, s, market_context))
-            time.sleep(1.0)
+            mkt = market_of_symbol(s)
+            bm_info = BENCHMARK_FOR[mkt]
+            bm_symbol = bm_info["symbol"]
+            bm_name = bm_info["name_zh"]
+            bm_df = bench_cache.get(bm_symbol)
+
+            if bm_df is None:
+                # 退一步：臨時抓（通常不會走到這）
+                bm_df = fetch_history(bm_symbol, period="1y", retries=3)
+
+            print(f"🔍 正在分析 {s} ...（基準：{bm_symbol}）")
+            stock_results.append(analyze_stock(client, s, market_context, bm_df, bm_name))
+            time.sleep(0.9)
         except Exception as e:
             errors.append(f"{s}: {e}")
             print(f"❌ {s} 失敗：{e}")
@@ -739,7 +831,7 @@ def main():
     msg = (
         f"📚 教學版股市戰報（{datetime.now(TZ).strftime('%m/%d')}）\n"
         f"個股：偏多{bull}｜觀望{watch}｜偏空{bear}\n"
-        f"大盤：TWII/GSPC/IXIC 已更新\n"
+        f"新增：20日相關係數 + 60日Beta\n"
         f"錯誤：{len(errors)}\n\n"
         f"👉 查看網頁：\n{page_url}"
     )

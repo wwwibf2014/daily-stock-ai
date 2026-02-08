@@ -17,17 +17,12 @@ from google import genai
 TARGET_STOCKS = ["2330.TW", "2317.TW", "0050.TW", "NVDA", "AAPL"]
 TZ = ZoneInfo("Asia/Taipei")
 
-# 你指定的模型
 GEMINI_MODEL = "gemma-3-27b-it"
-
-# 圖表顯示根數（你指定 120）
 CHART_BARS = 120
 
-# GitHub Pages 連結（可用環境變數覆蓋）
 GITHUB_USER = os.getenv("GITHUB_USER", "wwwibf2014")
 REPO_NAME = os.getenv("REPO_NAME", "daily-stock-ai")
 
-# 股票繁體中文名稱（可自行擴充）
 STOCK_NAMES_ZH = {
     "2330.TW": "台積電",
     "2317.TW": "鴻海",
@@ -45,7 +40,6 @@ def require_env(name: str) -> str:
         raise RuntimeError(f"缺少必要環境變數：{name}")
     return v
 
-
 def safe_parse_json(text: str) -> dict:
     cleaned = (text or "").strip().replace("```json", "").replace("```", "").strip()
     try:
@@ -56,31 +50,19 @@ def safe_parse_json(text: str) -> dict:
             raise ValueError(f"AI 回傳不是 JSON：{cleaned[:200]}")
         return json.loads(m.group(0))
 
-
 def flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    yfinance 偶爾會回傳 MultiIndex 欄位（兩層），造成 df['Close'] 變成 DataFrame。
-    這裡把欄位扁平化，保證 Open/High/Low/Close/Volume 是單層。
-    """
     if isinstance(df.columns, pd.MultiIndex):
         new_cols = []
         for col in df.columns:
             parts = [str(x) for x in col if str(x) != ""]
-            if "Open" in parts:
-                new_cols.append("Open")
-            elif "High" in parts:
-                new_cols.append("High")
-            elif "Low" in parts:
-                new_cols.append("Low")
-            elif "Close" in parts:
-                new_cols.append("Close")
-            elif "Volume" in parts:
-                new_cols.append("Volume")
-            else:
-                new_cols.append("_".join(parts))
+            if "Open" in parts: new_cols.append("Open")
+            elif "High" in parts: new_cols.append("High")
+            elif "Low" in parts: new_cols.append("Low")
+            elif "Close" in parts: new_cols.append("Close")
+            elif "Volume" in parts: new_cols.append("Volume")
+            else: new_cols.append("_".join(parts))
         df.columns = new_cols
     return df
-
 
 def nz(x, default=0.0) -> float:
     if x is None:
@@ -92,41 +74,34 @@ def nz(x, default=0.0) -> float:
         pass
     return float(x)
 
-
 # ===========================
 # 技術指標（繁體中文）
 # ===========================
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # 均線
     df["20日均線"] = df["Close"].rolling(20).mean()
     df["60日均線"] = df["Close"].rolling(60).mean()
 
-    # RSI(14) 相對強弱指標
     delta = df["Close"].diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss.replace(0, pd.NA)
     df["相對強弱指標RSI(14)"] = 100 - (100 / (1 + rs))
 
-    # MACD(12,26,9) 平滑異同移動平均線
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
     df["平滑異同移動平均線MACD"] = ema12 - ema26
     df["MACD訊號線"] = df["平滑異同移動平均線MACD"].ewm(span=9, adjust=False).mean()
     df["MACD柱狀體"] = df["平滑異同移動平均線MACD"] - df["MACD訊號線"]
 
-    # 20日乖離率(%)
     df["20日乖離率(%)"] = (df["Close"] / df["20日均線"] - 1) * 100
 
-    # 成交量：20日均量、均量比
     if "Volume" in df.columns:
         df["20日均量"] = df["Volume"].rolling(20).mean()
         df["均量比(今日/20日)"] = df["Volume"] / df["20日均量"]
 
     return df
-
 
 def fetch_history(symbol: str, period="1y", retries=3) -> pd.DataFrame:
     last_err = None
@@ -148,19 +123,15 @@ def fetch_history(symbol: str, period="1y", retries=3) -> pd.DataFrame:
             return df
         except Exception as e:
             last_err = e
-            wait = 1.2 * i
-            print(f"⚠️ 抓取失敗 {symbol}（第 {i}/{retries} 次）：{e}，{wait:.1f}s 後重試")
-            time.sleep(wait)
+            time.sleep(1.2 * i)
 
     raise RuntimeError(f"{symbol} 抓取最終失敗：{last_err}")
-
 
 # ===========================
 # 分析單檔
 # ===========================
 def analyze_stock(client: genai.Client, symbol: str):
-    df = fetch_history(symbol, period="1y", retries=3)
-    df = calculate_indicators(df)
+    df = calculate_indicators(fetch_history(symbol, period="1y", retries=3))
     latest = df.iloc[-1]
 
     close = nz(latest.get("Close"), 0.0)
@@ -217,20 +188,15 @@ MACD柱狀體：{macd_hist:.4f}
     if not isinstance(tips, list):
         tips = []
 
-    # 近 120 根資料做圖
     tail = df.tail(CHART_BARS).copy()
     labels = [d.strftime("%Y-%m-%d") for d in tail.index]
 
-    # ✅ 修正：K線資料每筆都帶 x，讓 financial plugin 正常吃到
-    ohlc = []
-    for dt, o, h, l, c in zip(labels, tail["Open"], tail["High"], tail["Low"], tail["Close"]):
-        if pd.isna(o) or pd.isna(h) or pd.isna(l) or pd.isna(c):
-            continue
-        ohlc.append({"x": dt, "o": float(o), "h": float(h), "l": float(l), "c": float(c)})
-
     chart_data = {
-        "labels": labels,  # 其他圖表使用
-        "ohlc": ohlc,      # K線使用
+        "labels": labels,
+        "open": [None if pd.isna(x) else float(x) for x in tail["Open"]],
+        "high": [None if pd.isna(x) else float(x) for x in tail["High"]],
+        "low":  [None if pd.isna(x) else float(x) for x in tail["Low"]],
+        "close":[None if pd.isna(x) else float(x) for x in tail["Close"]],
         "volume": [0 if pd.isna(v) else float(v) for v in tail.get("Volume", pd.Series([0]*len(tail)))],
         "ma20": [None if pd.isna(x) else float(x) for x in tail["20日均線"]],
         "ma60": [None if pd.isna(x) else float(x) for x in tail["60日均線"]],
@@ -248,29 +214,27 @@ MACD柱狀體：{macd_hist:.4f}
         "comment": str(data.get("reason", "")).strip(),
         "tips": [str(x).strip() for x in tips[:3]],
 
-        "open": round(open_, 2),
-        "high": round(high, 2),
-        "low": round(low, 2),
+        "open_now": round(open_, 2),
+        "high_now": round(high, 2),
+        "low_now": round(low, 2),
         "price": round(close, 2),
 
-        "ma20": round(ma20, 2),
-        "ma60": round(ma60, 2),
-        "rsi": round(rsi, 2),
-        "macd": round(macd, 4),
-        "macd_sig": round(macd_sig, 4),
-        "macd_hist": round(macd_hist, 4),
+        "ma20_now": round(ma20, 2),
+        "ma60_now": round(ma60, 2),
+        "rsi_now": round(rsi, 2),
+        "macd_now": round(macd, 4),
+        "macd_hist_now": round(macd_hist, 4),
 
-        "volume": int(vol),
-        "vol_ma20": int(vol_ma20),
-        "vr": round(vr, 2),
-        "bias20": round(bias20, 2),
+        "volume_now": int(vol),
+        "vol_ma20_now": int(vol_ma20),
+        "vr_now": round(vr, 2),
+        "bias20_now": round(bias20, 2),
 
         "chart_data": json.dumps(chart_data, ensure_ascii=False),
     }
 
-
 # ===========================
-# HTML（教學版 + tooltip + 4張圖）
+# HTML（固定 Chart.js 版本）
 # ===========================
 def render_html(results, errors):
     html_template = r"""
@@ -281,10 +245,8 @@ def render_html(results, errors):
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AI 每日股市戰報（教學版）</title>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/luxon@3"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial@0.2.1"></script>
+<!-- ✅ 固定 Chart.js 版本，降低 source map / 相依問題 -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f3f5f7; padding: 18px; max-width: 1060px; margin: 0 auto; }
@@ -307,7 +269,6 @@ def render_html(results, errors):
   .chip { background:#f7f7f7; padding: 6px 10px; border-radius: 12px; color:#333; }
   .chip b { font-weight: 900; }
 
-  /* tooltip */
   .tt { position: relative; display: inline-block; cursor: help; font-weight: 900; text-decoration: underline dotted; text-underline-offset: 3px; }
   .tt .tip {
     position: absolute;
@@ -353,7 +314,6 @@ def render_html(results, errors):
   @media (min-width: 980px){ .grid { grid-template-columns: 1fr 1fr; } }
   .explain { margin-top: 10px; color:#555; line-height: 1.6; }
   .explain b { color:#222; }
-
   .footer { text-align:center; color:#999; margin: 18px 0 10px; font-size: 0.9em; }
 </style>
 </head>
@@ -384,9 +344,9 @@ def render_html(results, errors):
     <div>
       <div class="title">{{ r.symbol }}{% if r.name_zh %}（{{ r.name_zh }}）{% endif %}</div>
       <div class="kline">
-        今日K線：開 <b>{{ r.open }}</b>｜高 <b>{{ r.high }}</b>｜低 <b>{{ r.low }}</b>｜收 <b>{{ r.price }}</b>
+        今日K線：開 <b>{{ r.open_now }}</b>｜高 <b>{{ r.high_now }}</b>｜低 <b>{{ r.low_now }}</b>｜收 <b>{{ r.price }}</b>
         <span class="tt" tabindex="0">K線是什麼？
-          <span class="tip"><b>K線=一天的價格故事</b><br>開=開始、收=結束、高/低=最高/最低。新手先看收盤在不在均線上方。</span>
+          <span class="tip"><b>K線=一天的價格故事</b><br>開=開始、收=結束、高/低=最高/最低。</span>
         </span>
       </div>
     </div>
@@ -394,16 +354,15 @@ def render_html(results, errors):
   </div>
 
   <div class="meta">
-    <div class="chip"><span class="tt" tabindex="0">20日均線<span class="tip"><b>近20天平均價</b><br>收盤在上方：常被解讀偏強；跌破：可能轉弱或整理。</span></span>：<b>{{ r.ma20 }}</b></div>
-    <div class="chip"><span class="tt" tabindex="0">60日均線<span class="tip"><b>中期趨勢參考</b><br>20日看短，60日看中；兩者一起看更清楚。</span></span>：<b>{{ r.ma60 }}</b></div>
-    <div class="chip"><span class="tt" tabindex="0">RSI(14)<span class="tip"><b>熱度(0~100)</b><br>&gt;70偏熱、&lt;30偏冷（不代表立刻反轉）。</span></span>：<b>{{ r.rsi }}</b></div>
-    <div class="chip"><span class="tt" tabindex="0">MACD<span class="tip"><b>動能指標</b><br>MACD&gt;訊號線：動能偏強；反之偏弱。</span></span>：<b>{{ r.macd }}</b></div>
-    <div class="chip"><span class="tt" tabindex="0">MACD柱狀體<span class="tip"><b>MACD-訊號線</b><br>轉正：動能變強跡象；轉負：動能轉弱跡象。</span></span>：<b>{{ r.macd_hist }}</b></div>
-
-    <div class="chip"><span class="tt" tabindex="0">成交量<span class="tip"><b>量=力氣</b><br>價漲＋量增更有底氣；價漲＋量縮可能續航不足。</span></span>：<b>{{ r.volume }}</b></div>
-    <div class="chip"><span class="tt" tabindex="0">20日均量<span class="tip"><b>近20天平均成交量</b><br>用來比今天量是大還小。</span></span>：<b>{{ r.vol_ma20 }}</b></div>
-    <div class="chip"><span class="tt" tabindex="0">均量比<span class="tip"><b>今日量 / 20日均量</b><br>1.0=差不多；>1較熱；<1較冷。</span></span>：<b>{{ r.vr }}</b></div>
-    <div class="chip"><span class="tt" tabindex="0">20日乖離率<span class="tip"><b>跟20日均線差多遠(%)</b><br>太大容易震盪加大（不等於一定回檔）。</span></span>：<b>{{ r.bias20 }}</b></div>
+    <div class="chip">20日均線：<b>{{ r.ma20_now }}</b></div>
+    <div class="chip">60日均線：<b>{{ r.ma60_now }}</b></div>
+    <div class="chip">RSI(14)：<b>{{ r.rsi_now }}</b></div>
+    <div class="chip">MACD：<b>{{ r.macd_now }}</b></div>
+    <div class="chip">MACD柱狀體：<b>{{ r.macd_hist_now }}</b></div>
+    <div class="chip">成交量：<b>{{ r.volume_now }}</b></div>
+    <div class="chip">20日均量：<b>{{ r.vol_ma20_now }}</b></div>
+    <div class="chip">均量比：<b>{{ r.vr_now }}</b></div>
+    <div class="chip">20日乖離率：<b>{{ r.bias20_now }}</b></div>
   </div>
 
   <div class="teachbox {{ r.signal }}">
@@ -421,45 +380,81 @@ def render_html(results, errors):
       <div><div style="font-weight:900;margin:4px 0 8px;">③ RSI（看熱度）</div><canvas id="rsi{{ loop.index }}"></canvas></div>
       <div><div style="font-weight:900;margin:4px 0 8px;">④ MACD（看動能）</div><canvas id="macd{{ loop.index }}"></canvas></div>
     </div>
-    <div class="explain"><b>小抄：</b>新手先看「均線＋成交量」，再用 RSI/MACD 做確認。</div>
   </div>
 
   <script>
     (function(){
       const data = {{ r.chart_data | safe }};
 
-      // ✅ K線：使用 timeseries + parsing:false，並且 ohlc 每筆都帶 x
-      new Chart(document.getElementById("k{{ loop.index }}"), {
-        type: "candlestick",
-        data: {
-          datasets: [
-            { label: "K線（開高低收）", data: data.ohlc },
-            { label: "20日均線", type: "line", data: data.ma20, spanGaps: true },
-            { label: "60日均線", type: "line", data: data.ma60, spanGaps: true }
-          ]
-        },
-        options: {
-          parsing: false,
-          plugins: { legend: { display: true } },
-          scales: { x: { type: "timeseries", time: { unit: "day" }, display:false } }
+      // 自繪簡化K線（wick + body），不依賴 candlestick 插件
+      const candlePlugin = {
+        id: 'candlePlugin',
+        afterDatasetsDraw(chart) {
+          const {ctx, scales: {x, y}} = chart;
+          ctx.save();
+
+          // wick
+          ctx.lineWidth = 1;
+          ctx.globalAlpha = 0.9;
+          for (let i=0; i<data.labels.length; i++){
+            const lab = data.labels[i];
+            const o = data.open[i], h = data.high[i], l = data.low[i], c = data.close[i];
+            if (o==null || h==null || l==null || c==null) continue;
+
+            const xPos = x.getPixelForValue(lab);
+            const yHi = y.getPixelForValue(h);
+            const yLo = y.getPixelForValue(l);
+
+            ctx.beginPath();
+            ctx.moveTo(xPos, yHi);
+            ctx.lineTo(xPos, yLo);
+            ctx.stroke();
+          }
+
+          // body
+          const barW = Math.max(3, Math.min(8, chart.chartArea.width / data.labels.length * 0.6));
+          for (let i=0; i<data.labels.length; i++){
+            const lab = data.labels[i];
+            const o = data.open[i], c = data.close[i];
+            if (o==null || c==null) continue;
+
+            const xPos = x.getPixelForValue(lab);
+            const yO = y.getPixelForValue(o);
+            const yC = y.getPixelForValue(c);
+
+            const top = Math.min(yO, yC);
+            const height = Math.max(1, Math.abs(yC - yO));
+            ctx.fillRect(xPos - barW/2, top, barW, height);
+          }
+
+          ctx.restore();
         }
+      };
+
+      new Chart(document.getElementById("k{{ loop.index }}"), {
+        type: "line",
+        data: { labels: data.labels, datasets: [
+          { label: "20日均線", data: data.ma20, spanGaps:true },
+          { label: "60日均線", data: data.ma60, spanGaps:true }
+        ]},
+        options: { plugins: { legend: { display:true } }, scales: { x: { display:false } } },
+        plugins: [candlePlugin]
       });
 
       new Chart(document.getElementById("v{{ loop.index }}"), {
-        data: {
-          labels: data.labels,
-          datasets: [
-            { type:"bar", label:"成交量", data: data.volume },
-            { type:"line", label:"20日均量", data: data.vol_ma20, spanGaps:true }
-          ]
-        },
-        options: { plugins: { legend: { display: true } }, scales: { x: { display:false } } }
+        data: { labels: data.labels, datasets: [
+          { type:"bar", label:"成交量", data: data.volume },
+          { type:"line", label:"20日均量", data: data.vol_ma20, spanGaps:true }
+        ]},
+        options: { plugins: { legend: { display:true } }, scales: { x: { display:false } } }
       });
 
       new Chart(document.getElementById("rsi{{ loop.index }}"), {
         type: "line",
-        data: { labels: data.labels, datasets: [{ label:"相對強弱指標 RSI(14)", data: data.rsi, spanGaps:true }] },
-        options: { plugins: { legend: { display: true } }, scales: { x: { display:false } } }
+        data: { labels: data.labels, datasets: [
+          { label:"相對強弱指標 RSI(14)", data: data.rsi, spanGaps:true }
+        ]},
+        options: { plugins: { legend: { display:true } }, scales: { x: { display:false } } }
       });
 
       new Chart(document.getElementById("macd{{ loop.index }}"), {
@@ -468,14 +463,14 @@ def render_html(results, errors):
           { type:"line", label:"MACD", data: data.macd, spanGaps:true },
           { type:"line", label:"MACD訊號線", data: data.macd_sig, spanGaps:true }
         ]},
-        options: { plugins: { legend: { display: true } }, scales: { x: { display:false } } }
+        options: { plugins: { legend: { display:true } }, scales: { x: { display:false } } }
       });
     })();
   </script>
 </div>
 {% endfor %}
 
-<div class="footer">教學提醒：指標是工具，不是保證答案。越多指標同方向，通常越「像」有趨勢，但仍要注意風險。</div>
+<div class="footer">教學提醒：指標是工具，不是保證答案。</div>
 </body>
 </html>
 """
@@ -486,7 +481,6 @@ def render_html(results, errors):
         model=GEMINI_MODEL,
     )
 
-
 def line_push(line_token: str, to_id: str, msg: str):
     r = requests.post(
         "https://api.line.me/v2/bot/message/push",
@@ -496,7 +490,6 @@ def line_push(line_token: str, to_id: str, msg: str):
     )
     if r.status_code >= 300:
         raise RuntimeError(f"LINE 推播失敗 {r.status_code}: {r.text[:200]}")
-
 
 def main():
     client = genai.Client(api_key=require_env("GEMINI_API_KEY"))
@@ -515,12 +508,10 @@ def main():
             errors.append(f"{s}: {e}")
             print(f"❌ {s} 失敗：{e}")
 
-    # 產出網頁
     html = render_html(results, errors)
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html)
 
-    # LINE 摘要
     page_url = f"https://{GITHUB_USER}.github.io/{REPO_NAME}/"
     bull = sum(1 for x in results if x["signal"] == "偏多")
     bear = sum(1 for x in results if x["signal"] == "偏空")
@@ -530,7 +521,7 @@ def main():
         f"📚 教學版股市戰報（{datetime.now(TZ).strftime('%m/%d')}）\n"
         f"偏多：{bull}｜觀望：{watch}｜偏空：{bear}\n"
         f"抓取失敗：{len(errors)}\n\n"
-        f"👉 查看K線/成交量/RSI/MACD（含白話泡泡解釋）：\n{page_url}"
+        f"👉 查看網頁：\n{page_url}"
     )
 
     try:
@@ -538,7 +529,6 @@ def main():
         print("✅ LINE 推播成功")
     except Exception as e:
         print(f"⚠️ LINE 推播失敗（不影響網頁生成）：{e}")
-
 
 if __name__ == "__main__":
     main()

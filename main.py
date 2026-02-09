@@ -31,7 +31,7 @@ GEMINI_MODEL = "gemma-3-27b-it"
 # 顯示最近幾根K線（交易日）
 CHART_BARS = 120
 
-# 預測：顯示在圖上 10 天；文字給 5/10/30
+# 預測：圖上顯示 10 天；文字給 5/10/30
 PRED_DAYS_ON_CHART = 10
 PRED_HORIZONS = [5, 10, 30]
 PRED_LOOKBACK_DAYS = 60
@@ -42,7 +42,7 @@ RISK_WINDOW = 120
 # 轉折：分數條件
 TURN_SCORE_WINDOW_SLOPE = 10
 
-# 歷史資料範圍（同時給：勝率、beta/corr、風險…）
+# 歷史資料範圍
 HIST_PERIOD = "2y"
 
 # GitHub Pages URL
@@ -61,7 +61,7 @@ BENCHMARK_FOR = {
 }
 
 # ===========================
-# 工具
+# ✅ 工具：env / json / ai-retry
 # ===========================
 def require_env(name: str) -> str:
     v = os.getenv(name)
@@ -69,16 +69,78 @@ def require_env(name: str) -> str:
         raise RuntimeError(f"缺少必要環境變數：{name}")
     return v
 
-def safe_parse_json(text: str) -> dict:
-    cleaned = (text or "").strip().replace("```json", "").replace("```", "").strip()
+def extract_json_object(text: str) -> dict:
+    """
+    更耐髒：從回傳文字中抓出第一個 JSON 物件 { ... } 並解析。
+    避免 AI 多講話導致 json.loads 爆掉。
+    """
+    cleaned = (text or "").strip()
+    cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+
+    # 先直接嘗試
     try:
         return json.loads(cleaned)
     except Exception:
-        m = re.search(r"\{[\s\S]*\}", cleaned)
-        if not m:
-            raise ValueError(f"AI 回傳不是 JSON：{cleaned[:200]}")
-        return json.loads(m.group(0))
+        pass
 
+    # 再抓第一段 {...}
+    m = re.search(r"\{[\s\S]*\}", cleaned)
+    if not m:
+        raise ValueError(f"AI 回傳不是 JSON：{cleaned[:200]}")
+    return json.loads(m.group(0))
+
+def call_ai_with_retry(client: genai.Client, prompt: str, model: str, max_retry=6):
+    """
+    專門處理 503 model overloaded：
+    1,2,4,8,16,30 秒重試；仍失敗就丟出最後錯誤。
+    """
+    last_err = None
+    for i in range(max_retry):
+        try:
+            return client.models.generate_content(model=model, contents=prompt)
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            if ("503" in msg) or ("overloaded" in msg.lower()) or ("UNAVAILABLE" in msg):
+                wait = min(2 ** i, 30)
+                time.sleep(wait)
+                continue
+            raise
+    raise last_err
+
+def genai_json(client: genai.Client, prompt: str, fallback: dict):
+    """
+    取得 AI JSON；解析失敗或 503 過載等錯誤時，回 fallback（不中斷整個流程）
+    """
+    try:
+        resp = call_ai_with_retry(client, prompt, GEMINI_MODEL)
+        return extract_json_object(resp.text)
+    except Exception:
+        return fallback
+
+# ===========================
+# ✅ AI 失敗時：備援文字（仍可生成教學內容）
+# ===========================
+def fallback_market_json():
+    return {
+        "mood": "整理",
+        "summary": "AI暫時忙碌，先用均線與指標做基本解讀（不影響圖表與數據）。",
+        "teach": ["看收盤在20MA上/下判斷偏強弱", "成交量比均量大代表更有力道"]
+    }
+
+def fallback_stock_json():
+    return {
+        "signal": "觀望",
+        "risk_text": "AI暫時忙碌：先看ATR/VaR評估波動與風險。",
+        "turn_text": "先看轉折分數：分數高代表趨勢/動能/量能較完整。",
+        "hold_text": "用20MA與紀律線做續抱/警示，先保護資本。",
+        "tips": ["先看風險燈號再看轉折", "量能要配合走勢才可靠", "跌破20MA要提高警覺"],
+        "market_link": "先用相關係數/Beta白話判斷大盤影響程度。"
+    }
+
+# ===========================
+# 資料抓取
+# ===========================
 def flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         new_cols = []
@@ -93,27 +155,6 @@ def flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
         df.columns = new_cols
     return df
 
-def nz(x, default=0.0) -> float:
-    if x is None:
-        return default
-    try:
-        if pd.isna(x):
-            return default
-    except Exception:
-        pass
-    return float(x)
-
-def market_of_symbol(symbol: str) -> str:
-    return "TW" if symbol.upper().endswith(".TW") else "US"
-
-def fmt_prob(p):
-    if p is None:
-        return "資料不足"
-    return f"{int(round(p*100))}%"
-
-# ===========================
-# 資料抓取
-# ===========================
 def fetch_history(symbol: str, period=HIST_PERIOD, retries=3) -> pd.DataFrame:
     last_err = None
     for i in range(1, retries + 1):
@@ -137,6 +178,22 @@ def fetch_history(symbol: str, period=HIST_PERIOD, retries=3) -> pd.DataFrame:
             last_err = e
             time.sleep(1.2 * i)
     raise RuntimeError(f"{symbol} 抓取最終失敗：{last_err}")
+
+def nz(x, default=0.0) -> float:
+    try:
+        if x is None or pd.isna(x):
+            return default
+    except Exception:
+        pass
+    return float(x)
+
+def market_of_symbol(symbol: str) -> str:
+    return "TW" if symbol.upper().endswith(".TW") else "US"
+
+def fmt_prob(p):
+    if p is None:
+        return "資料不足"
+    return f"{int(round(p*100))}%"
 
 # ===========================
 # 技術指標（繁體中文）
@@ -184,54 +241,33 @@ def calc_atr(df: pd.DataFrame, n=14) -> pd.Series:
         (high - prev_close).abs(),
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
-    atr = tr.rolling(n).mean()
-    return atr
+    return tr.rolling(n).mean()
 
 def calc_mdd(close: pd.Series) -> float:
-    # 最大回落（負值）
     peak = close.cummax()
     dd = close / peak - 1.0
     return float(dd.min()) if len(dd) else 0.0
 
 def calc_var95(returns: pd.Series) -> float:
-    # 95% VaR：用 5%分位數（通常是負值）
     if returns is None or len(returns.dropna()) < 30:
         return np.nan
     return float(np.nanquantile(returns.dropna().values, 0.05))
 
 def risk_level(atr_pct, var95, mdd):
-    """
-    atr_pct: 正值（%）
-    var95: 通常負值（如 -0.02 = -2%）
-    mdd: 負值（如 -0.15 = -15%）
-    """
     score = 0
-    # ATR%
     if atr_pct >= 4.0: score += 2
     elif atr_pct >= 2.0: score += 1
-
-    # VaR（越負越危險）
     if var95 <= -0.03: score += 2
     elif var95 <= -0.02: score += 1
-
-    # MDD（越負越危險）
     if mdd <= -0.25: score += 2
     elif mdd <= -0.15: score += 1
-
-    if score >= 4:
-        return "🔴 高"
-    elif score >= 2:
-        return "🟡 中"
-    else:
-        return "🟢 低"
+    if score >= 4: return "🔴 高"
+    if score >= 2: return "🟡 中"
+    return "🟢 低"
 
 def calc_trailing_stop(df: pd.DataFrame, atr: pd.Series):
-    """
-    紀律線（教學版）：近20日最低 - 0.5*ATR
-    """
     low20 = df["Low"].rolling(20).min()
-    stop = low20 - 0.5 * atr
-    return stop
+    return low20 - 0.5 * atr
 
 # ===========================
 # ② 轉折點：轉折分數（0~100）+ 訊號
@@ -242,56 +278,30 @@ def turning_score(df: pd.DataFrame):
         return None, "資料不足"
 
     last = df.iloc[-1]
-
     score = 0
-    reasons = []
 
-    # 1) 收盤在 20MA 上
     if pd.notna(last["20日均線"]) and last["Close"] > last["20日均線"]:
-        score += 20; reasons.append("收盤在20日均線上（偏強）")
-    else:
-        reasons.append("收盤在20日均線下（偏弱）")
-
-    # 2) 20MA 在 60MA 上
+        score += 20
     if pd.notna(last["60日均線"]) and pd.notna(last["20日均線"]) and last["20日均線"] > last["60日均線"]:
-        score += 20; reasons.append("20MA在60MA上（趨勢偏多）")
-    else:
-        reasons.append("20MA不在60MA上（趨勢未偏多）")
+        score += 20
 
-    # 3) 20MA 斜率（近10日）
     ma20 = df["20日均線"].dropna()
     if len(ma20) >= TURN_SCORE_WINDOW_SLOPE + 1:
         slope = ma20.iloc[-1] - ma20.iloc[-(TURN_SCORE_WINDOW_SLOPE+1)]
         if slope > 0:
-            score += 20; reasons.append("20MA上揚（趨勢升溫）")
-        else:
-            reasons.append("20MA走平/下彎（趨勢保守）")
-    else:
-        reasons.append("20MA資料不足（斜率略過）")
+            score += 20
 
-    # 4) MACD柱狀體：是否轉正或走升
     hist = df["MACD柱狀體"].dropna()
     if len(hist) >= 2:
         if hist.iloc[-1] > 0:
-            score += 20; reasons.append("MACD柱狀體為正（動能偏多）")
+            score += 20
         elif hist.iloc[-1] > hist.iloc[-2]:
-            score += 10; reasons.append("MACD柱狀體回升（動能改善）")
-        else:
-            reasons.append("MACD柱狀體偏弱（動能不足）")
-    else:
-        reasons.append("MACD資料不足")
+            score += 10
 
-    # 5) 量能配合：均量比 > 1
     if "均量比(今日/20日)" in df.columns and pd.notna(last["均量比(今日/20日)"]):
-        vr = float(last["均量比(今日/20日)"])
-        if vr > 1.0:
-            score += 20; reasons.append("量能大於均量（有力氣）")
-        else:
-            reasons.append("量能偏小（力氣不足）")
-    else:
-        reasons.append("量能資料不足")
+        if float(last["均量比(今日/20日)"]) > 1.0:
+            score += 20
 
-    # 分類
     if score >= 70:
         label = "偏多轉折（可觀察）"
     elif score <= 40:
@@ -305,35 +315,30 @@ def turning_score(df: pd.DataFrame):
 # ③ 持有期優化（教學版）
 # ===========================
 def holding_plan(turn_score, risk_lv):
-    """
-    用 轉折分數 + 風險燈號，給新手一個「持有框架」
-    """
     if turn_score is None:
         return {"range": "資料不足", "hold": "資料不足", "warn": "資料不足", "rule": "資料不足"}
 
     is_red = str(risk_lv).startswith("🔴")
     if turn_score >= 70 and not is_red:
-        plan = {
+        return {
             "range": "10~30 個交易日",
             "hold": "偏向波段持有（趨勢較完整）",
             "warn": "若跌破20MA或紀律線，代表轉弱需提高警覺",
             "rule": "續抱條件：收盤維持在20MA上方"
         }
-    elif 40 < turn_score < 70 and not is_red:
-        plan = {
+    if 40 < turn_score < 70 and not is_red:
+        return {
             "range": "5~10 個交易日",
             "hold": "續抱觀察（等待趨勢更明確）",
             "warn": "若量增跌破20MA，代表轉弱訊號更明顯",
             "rule": "觀察重點：量能是否配合、MACD是否持續改善"
         }
-    else:
-        plan = {
-            "range": "保守（先保護資本）",
-            "hold": "以風險控管為優先（先觀察再說）",
-            "warn": "風險偏高時，避免硬抱；用紀律線保護資本",
-            "rule": "風險優先：跌破紀律線 → 風險升高（教學警示）"
-        }
-    return plan
+    return {
+        "range": "保守（先保護資本）",
+        "hold": "以風險控管為優先（先觀察再說）",
+        "warn": "風險偏高時，避免硬抱；用紀律線保護資本",
+        "rule": "風險優先：跌破紀律線 → 風險升高（教學警示）"
+    }
 
 # ===========================
 # 相關係數（20日）+ Beta（60日）
@@ -341,29 +346,18 @@ def holding_plan(turn_score, risk_lv):
 def compute_corr_beta(stock_df: pd.DataFrame, bench_df: pd.DataFrame, corr_window=20, beta_window=60):
     s = stock_df[["Close"]].rename(columns={"Close": "stock"})
     b = bench_df[["Close"]].rename(columns={"Close": "bench"})
-
     merged = s.join(b, how="inner").dropna()
     if len(merged) < max(corr_window, beta_window) + 5:
         return None, None
-
     ret = merged.pct_change().dropna()
     if len(ret) < max(corr_window, beta_window):
         return None, None
-
     corr20 = ret["stock"].tail(corr_window).corr(ret["bench"].tail(corr_window))
-
     tail_beta = ret.tail(beta_window)
     var_b = tail_beta["bench"].var()
-    if var_b == 0 or pd.isna(var_b):
-        beta60 = None
-    else:
-        beta60 = tail_beta["stock"].cov(tail_beta["bench"]) / var_b
-
-    if pd.isna(corr20):
-        corr20 = None
-    if beta60 is not None and pd.isna(beta60):
-        beta60 = None
-
+    beta60 = None if (var_b == 0 or pd.isna(var_b)) else tail_beta["stock"].cov(tail_beta["bench"]) / var_b
+    if pd.isna(corr20): corr20 = None
+    if beta60 is not None and pd.isna(beta60): beta60 = None
     return corr20, beta60
 
 # ===========================
@@ -373,15 +367,12 @@ def make_forecast(close_series: pd.Series, horizons=PRED_HORIZONS, lookback=PRED
     s = close_series.dropna()
     if len(s) < lookback + 5:
         return None
-
     last = float(s.iloc[-1])
     r = np.log(s / s.shift(1)).dropna().tail(lookback)
     mu = float(r.mean())
     sigma = float(r.std(ddof=1)) if len(r) > 2 else 0.0
-
-    z = 1.0  # 約 68% 區間
+    z = 1.0  # 約 68%
     out = {"last": last, "mu": mu, "sigma": sigma, "points": {}}
-
     for h in horizons:
         mid = last * float(np.exp(mu * h))
         upper = last * float(np.exp(mu * h + z * sigma * np.sqrt(h)))
@@ -390,7 +381,7 @@ def make_forecast(close_series: pd.Series, horizons=PRED_HORIZONS, lookback=PRED
     return out
 
 # ===========================
-# 上漲機率：條件統計勝率（保留原本）
+# 上漲機率：條件統計（教學用）
 # ===========================
 def conditional_up_probability(df: pd.DataFrame, horizon_days: int):
     df = df.copy().dropna(subset=["Close", "20日均線", "相對強弱指標RSI(14)", "MACD柱狀體"])
@@ -439,32 +430,31 @@ def conditional_up_probability(df: pd.DataFrame, horizon_days: int):
     return prob, n
 
 # ===========================
-# 箭頭訊號：均線/MACD/RSI/量
+# 箭頭訊號（教學用）
 # ===========================
 def detect_markers(df: pd.DataFrame):
     df = df.dropna().copy()
     if len(df) < 80:
         return []
-
     markers = []
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # MA 交叉
+    # MA交叉
     if pd.notna(prev["20日均線"]) and pd.notna(prev["60日均線"]) and pd.notna(last["20日均線"]) and pd.notna(last["60日均線"]):
         if prev["20日均線"] <= prev["60日均線"] and last["20日均線"] > last["60日均線"]:
             markers.append({"type": "up", "text": "均線黃金交叉（偏多）"})
         elif prev["20日均線"] >= prev["60日均線"] and last["20日均線"] < last["60日均線"]:
             markers.append({"type": "down", "text": "均線死亡交叉（轉弱）"})
 
-    # MACD 交叉
+    # MACD交叉
     if pd.notna(prev["平滑異同移動平均線MACD"]) and pd.notna(prev["MACD訊號線"]) and pd.notna(last["平滑異同移動平均線MACD"]) and pd.notna(last["MACD訊號線"]):
         if prev["平滑異同移動平均線MACD"] <= prev["MACD訊號線"] and last["平滑異同移動平均線MACD"] > last["MACD訊號線"]:
             markers.append({"type": "up", "text": "MACD翻多（動能轉強）"})
         elif prev["平滑異同移動平均線MACD"] >= prev["MACD訊號線"] and last["平滑異同移動平均線MACD"] < last["MACD訊號線"]:
             markers.append({"type": "down", "text": "MACD翻空（動能轉弱）"})
 
-    # RSI 警告
+    # RSI警告
     rsi = float(last["相對強弱指標RSI(14)"])
     if rsi >= 70:
         markers.append({"type": "warn", "text": "RSI偏熱（注意追高風險）"})
@@ -485,7 +475,7 @@ def detect_markers(df: pd.DataFrame):
     return markers
 
 # ===========================
-# 圖表資料（含預測線/區間/紀律線/箭頭）
+# 圖表資料（含預測/紀律線/箭頭）
 # ===========================
 def build_chart_data(df_ind: pd.DataFrame, forecast: dict | None, markers: list, trailing_stop: pd.Series | None):
     tail = df_ind.tail(CHART_BARS).copy()
@@ -544,9 +534,6 @@ def build_chart_data(df_ind: pd.DataFrame, forecast: dict | None, markers: list,
         data["pred_mid"] = none_hist + pred_mid
         data["pred_upper"] = none_hist + pred_upper
         data["pred_lower"] = none_hist + pred_lower
-
-        # 預測區間的「起點連接」：讓線看起來更連續（可選）
-        # 這裡不做硬連接，保持清楚：未來才開始畫
     else:
         data["pred_mid"] = [None] * len(hist_labels)
         data["pred_upper"] = [None] * len(hist_labels)
@@ -555,24 +542,22 @@ def build_chart_data(df_ind: pd.DataFrame, forecast: dict | None, markers: list,
     return data
 
 # ===========================
-# 大盤分析（AI只說環境，不講買賣）
+# 大盤分析（AI失敗則fallback）
 # ===========================
 def analyze_market_index(client: genai.Client, symbol: str, name_zh: str):
     df_raw = fetch_history(symbol, period=HIST_PERIOD, retries=3)
     df = calculate_indicators(df_raw)
 
-    # 風險（同樣可算）
     atr = calc_atr(df, 14)
     atr_pct = (atr / df["Close"] * 100).iloc[-1] if len(atr.dropna()) else np.nan
     ret = df["Close"].pct_change().dropna().tail(RISK_WINDOW)
     var95 = calc_var95(ret)
     mdd = calc_mdd(df["Close"].tail(RISK_WINDOW))
-    risk_lv = risk_level(float(atr_pct) if not pd.isna(atr_pct) else 0.0, float(var95) if not pd.isna(var95) else 0.0, float(mdd))
+    risk_lv = risk_level(float(atr_pct) if not pd.isna(atr_pct) else 0.0,
+                         float(var95) if not pd.isna(var95) else 0.0,
+                         float(mdd))
 
-    # 轉折
     tscore, tlabel = turning_score(df)
-
-    # 紀律線
     trail = calc_trailing_stop(df, atr)
 
     latest = df.iloc[-1]
@@ -611,13 +596,11 @@ MACD柱狀體：{macd_hist:.4f}
 }}
 """.strip()
 
-    resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-    data = safe_parse_json(resp.text)
+    data = genai_json(client, prompt, fallback_market_json())
 
     mood = data.get("mood", "整理")
     if mood not in ("偏多", "偏空", "整理"):
         mood = "整理"
-
     teach = data.get("teach", [])
     if not isinstance(teach, list):
         teach = []
@@ -658,14 +641,13 @@ MACD柱狀體：{macd_hist:.4f}
     }
 
 # ===========================
-# 個股分析（AI整合：風險/轉折/持有）
+# 個股分析（AI失敗則fallback）
 # ===========================
 def analyze_stock(client: genai.Client, symbol: str, market_context: dict, benchmark_df: pd.DataFrame, benchmark_name_zh: str):
     stock_df_raw = fetch_history(symbol, period=HIST_PERIOD, retries=3)
     df = calculate_indicators(stock_df_raw)
     latest = df.iloc[-1]
 
-    # 指標
     open_ = nz(latest.get("Open"), 0.0)
     high = nz(latest.get("High"), 0.0)
     low = nz(latest.get("Low"), 0.0)
@@ -684,46 +666,36 @@ def analyze_stock(client: genai.Client, symbol: str, market_context: dict, bench
     vr = nz(latest.get("均量比(今日/20日)"), 0.0)
     bias20 = nz(latest.get("20日乖離率(%)"), 0.0)
 
-    # 相關/ Beta
     corr20, beta60 = compute_corr_beta(stock_df_raw, benchmark_df, corr_window=20, beta_window=60)
 
-    # 預測（統計型）
     forecast = make_forecast(df["Close"])
     pred_points = forecast["points"] if forecast else None
 
-    # 機率（保留）
     prob3, n3 = conditional_up_probability(df, 3)
     prob5, n5 = conditional_up_probability(df, 5)
     prob10, n10 = conditional_up_probability(df, 10)
 
-    # 風險（ATR%、VaR、MDD、紀律線）
     atr = calc_atr(df, 14)
     atr_last = atr.iloc[-1] if len(atr.dropna()) else np.nan
     atr_pct = (atr_last / close * 100) if (not pd.isna(atr_last) and close != 0) else np.nan
 
     ret = df["Close"].pct_change().dropna().tail(RISK_WINDOW)
-    var95 = calc_var95(ret)  # daily return quantile
+    var95 = calc_var95(ret)
     mdd = calc_mdd(df["Close"].tail(RISK_WINDOW))
-    risk_lv = risk_level(float(atr_pct) if not pd.isna(atr_pct) else 0.0, float(var95) if not pd.isna(var95) else 0.0, float(mdd))
-
+    risk_lv = risk_level(float(atr_pct) if not pd.isna(atr_pct) else 0.0,
+                         float(var95) if not pd.isna(var95) else 0.0,
+                         float(mdd))
     trail = calc_trailing_stop(df, atr)
     trail_now = trail.iloc[-1] if len(trail.dropna()) else np.nan
 
-    # 轉折
     tscore, tlabel = turning_score(df)
-
-    # 持有計畫
     plan = holding_plan(tscore, risk_lv)
-
-    # 箭頭
     markers = detect_markers(df)
 
-    # 市場摘要（縮短）
     tw = market_context.get("TWII", {})
     us_sp = market_context.get("GSPC", {})
     us_nq = market_context.get("IXIC", {})
 
-    # 給 AI 做「白話總結」
     pred_txt = "資料不足"
     if pred_points:
         p5 = pred_points.get(5); p10 = pred_points.get(10); p30 = pred_points.get(30)
@@ -754,7 +726,7 @@ MDD（近120日最慘回落）：{float(mdd)*100:.2f}%
 
 轉折分數（0~100）：{tscore if tscore is not None else "資料不足"}（{tlabel}）
 
-持有計畫（請照這個模板寫成白話）：
+持有計畫（模板）：
 持有期範圍：{plan["range"]}
 續抱說法：{plan["hold"]}
 觀察警示：{plan["warn"]}
@@ -789,8 +761,7 @@ MDD（近120日最慘回落）：{float(mdd)*100:.2f}%
 }}
 """.strip()
 
-    resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-    data = safe_parse_json(resp.text)
+    data = genai_json(client, prompt, fallback_stock_json())
 
     signal = data.get("signal", "觀望")
     if signal not in ("偏多", "偏空", "觀望"):
@@ -800,7 +771,6 @@ MDD（近120日最慘回落）：{float(mdd)*100:.2f}%
     if not isinstance(tips, list):
         tips = []
 
-    # 圖表資料
     chart_data = build_chart_data(df, forecast, markers, trail)
 
     return {
@@ -887,7 +857,6 @@ def build_line_report(stock_results, page_url):
         tscore = r.get("turn_score", None)
         tscore_txt = "NA" if tscore is None else str(tscore)
 
-        # 10天目標
         tgt10 = ""
         if r.get("forecast_points") and 10 in r["forecast_points"]:
             pt = r["forecast_points"][10]
@@ -895,7 +864,6 @@ def build_line_report(stock_results, page_url):
 
         lines.append(f"\n{name}")
         lines.append(f"信號：{r['signal']}｜風險：{risk}｜轉折分數：{tscore_txt}｜5天機率：{p5}{tgt10}")
-        # 持有期一句
         lines.append(f"持有期：{r.get('plan_range','')}｜重點：{r.get('plan_rule','')}")
 
     lines.append(f"\n👉 網頁：{page_url}")
@@ -948,7 +916,6 @@ def render_html(market_results, stock_results, errors):
 
   .charts { margin-top:12px; background:#fbfbfb; border-radius:14px; padding:12px; }
   .footer { text-align:center; color:#999; margin:18px 0 10px; font-size:0.9em; }
-
   .hint { color:#555; line-height:1.6; }
 </style>
 </head>
@@ -968,7 +935,7 @@ def render_html(market_results, stock_results, errors):
 </div>
 
 {% if errors %}
-<div class="warn"><b>本次有錯誤</b><div class="mono">{{ errors|join("\n") }}</div></div>
+<div class="warn"><b>本次有錯誤（不影響網頁生成）</b><div class="mono">{{ errors|join("\n") }}</div></div>
 {% endif %}
 
 <!-- 大盤 -->
@@ -1321,7 +1288,6 @@ def render_html(market_results, stock_results, errors):
 {% endfor %}
 
 <div class="footer">提醒：此頁為教學示範。風險/轉折/持有皆為規則化解讀，不構成投資建議。</div>
-
 </body>
 </html>
 """
